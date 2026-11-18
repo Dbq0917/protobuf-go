@@ -284,19 +284,11 @@ func appendMap(b []byte, mapv reflect.Value, mapi *mapInfo, f *coderFieldInfo, o
 	if mapv.Len() == 0 {
 		return b, nil
 	}
-	if opts.Deterministic() {
-		return appendMapDeterministic(b, mapv, mapi, f, opts)
-	}
-	iter := mapv.MapRange()
-	for iter.Next() {
-		var err error
-		b = protowire.AppendVarint(b, f.wiretag)
-		b, err = appendMapItem(b, iter.Key(), iter.Value(), mapi, f, opts)
-		if err != nil {
-			return b, err
-		}
-	}
-	return b, nil
+	// Map entries are always serialized in sorted key order so that the
+	// wire output is stable for a given message. Caches keyed on the
+	// serialized bytes depend on this stability, and callers should not
+	// need to opt in to deterministic output to get it.
+	return appendMapDeterministic(b, mapv, mapi, f, opts)
 }
 
 func appendMapDeterministic(b []byte, mapv reflect.Value, mapi *mapInfo, f *coderFieldInfo, opts marshalOptions) ([]byte, error) {

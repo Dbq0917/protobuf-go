@@ -52,6 +52,9 @@ type MarshalOptions struct {
 	// If deterministic serialization is requested, map entries will be
 	// sorted by keys in lexographical order. This is an implementation
 	// detail and subject to change.
+	//
+	// Note that map entries are sorted by key even when this option is
+	// not set, so that the default output is stable for a given message.
 	Deterministic bool
 
 	// UseCachedSize indicates that the result of a previous Size call
@@ -174,6 +177,7 @@ func (o MarshalOptions) MarshalState(in protoiface.MarshalInput) (protoiface.Mar
 func (o MarshalOptions) marshal(b []byte, m protoreflect.Message) (out protoiface.MarshalOutput, err error) {
 	allowPartial := o.AllowPartial
 	o.AllowPartial = true
+	recordMarshal(m)
 	if methods := protoMethods(m); methods != nil && methods.Marshal != nil &&
 		!(o.Deterministic && methods.Flags&protoiface.SupportMarshalDeterministic == 0) {
 		in := protoiface.MarshalInput{
@@ -244,13 +248,15 @@ func (o MarshalOptions) marshalMessageSlow(b []byte, m protoreflect.Message) ([]
 	if messageset.IsMessageSet(m.Descriptor()) {
 		return o.marshalMessageSet(b, m)
 	}
-	fieldOrder := order.AnyFieldOrder
-	if o.Deterministic {
-		// TODO: This should use a more natural ordering like NumberFieldOrder,
-		// but doing so breaks golden tests that make invalid assumption about
-		// output stability of this implementation.
-		fieldOrder = order.LegacyFieldOrder
-	}
+	// Fields are always serialized in a deterministic order so that the
+	// wire output is stable for a given message. Caches keyed on the
+	// serialized bytes depend on this stability, and callers should not
+	// need to opt in to deterministic output to get it.
+	//
+	// TODO: This should use a more natural ordering like NumberFieldOrder,
+	// but doing so breaks golden tests that make invalid assumption about
+	// output stability of this implementation.
+	fieldOrder := order.LegacyFieldOrder
 	var err error
 	order.RangeFields(m, fieldOrder, func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
 		b, err = o.marshalField(b, fd, v)
@@ -305,10 +311,11 @@ func (o MarshalOptions) marshalList(b []byte, fd protoreflect.FieldDescriptor, l
 func (o MarshalOptions) marshalMap(b []byte, fd protoreflect.FieldDescriptor, mapv protoreflect.Map) ([]byte, error) {
 	keyf := fd.MapKey()
 	valf := fd.MapValue()
-	keyOrder := order.AnyKeyOrder
-	if o.Deterministic {
-		keyOrder = order.GenericKeyOrder
-	}
+	// Map entries are always serialized in sorted key order so that the
+	// wire output is stable for a given message. Caches keyed on the
+	// serialized bytes depend on this stability, and callers should not
+	// need to opt in to deterministic output to get it.
+	keyOrder := order.GenericKeyOrder
 	var err error
 	order.RangeEntries(mapv, keyOrder, func(key protoreflect.MapKey, value protoreflect.Value) bool {
 		b = protowire.AppendTag(b, fd.Number(), protowire.BytesType)
