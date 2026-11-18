@@ -16,6 +16,7 @@
 package protoregistry
 
 import (
+	stderrors "errors"
 	"fmt"
 	"os"
 	"strings"
@@ -79,6 +80,66 @@ var GlobalTypes *Types = new(Types)
 // must return this exact error value, not an error wrapping it.
 var NotFound = errors.New("not found")
 
+// registrationSource records where a descriptor or type was registered from,
+// so that registration conflicts can identify both sources involved.
+type registrationSource struct {
+	goPackage string // Go package path performing the registration; may be empty
+	filePath  string // proto file path; may be empty
+}
+
+func (s registrationSource) String() string {
+	switch {
+	case s.goPackage != "" && s.filePath != "":
+		return s.goPackage + " (" + s.filePath + ")"
+	case s.goPackage != "":
+		return s.goPackage
+	default:
+		return s.filePath
+	}
+}
+
+// sourceOf resolves the registration source of a descriptor or registered type.
+func sourceOf(v any) registrationSource {
+	switch d := v.(type) {
+	case protoreflect.EnumType:
+		return sourceOfDescriptor(d.Descriptor())
+	case protoreflect.MessageType:
+		return sourceOfDescriptor(d.Descriptor())
+	case protoreflect.ExtensionType:
+		return sourceOfDescriptor(d.TypeDescriptor())
+	case protoreflect.Descriptor:
+		return sourceOfDescriptor(d)
+	}
+	return registrationSource{}
+}
+
+// sourceOfDescriptor resolves the registration source of a descriptor.
+func sourceOfDescriptor(d protoreflect.Descriptor) registrationSource {
+	var src registrationSource
+	v := any(d.ParentFile())
+	if fd, ok := v.(protoreflect.FileDescriptor); ok {
+		src.filePath = fd.Path()
+	}
+	if d, ok := v.(interface{ GoPackagePath() string }); ok {
+		src.goPackage = d.GoPackagePath()
+	}
+	return src
+}
+
+// formatRegistrationConflict amends a registration conflict error with the
+// two sources involved, when they are known and distinct.
+func formatRegistrationConflict(err error, prev, curr any) error {
+	prevSrc, currSrc := sourceOf(prev), sourceOf(curr)
+	if prevSrc == (registrationSource{}) && currSrc == (registrationSource{}) {
+		return err
+	}
+	// Identical sources carry no diagnostic value and would only add noise.
+	if prevSrc.goPackage == currSrc.goPackage && prevSrc.filePath == currSrc.filePath {
+		return err
+	}
+	return errors.New("%v\n\tpreviously from: %q\n\tcurrently from:  %q", err, prevSrc, currSrc)
+}
+
 // Files is a registry for looking up or iterating over files and the
 // descriptors contained within them.
 // The Find and Range methods are safe for concurrent use.
@@ -126,7 +187,7 @@ func (r *Files) RegisterFile(file protoreflect.FileDescriptor) error {
 	if prev := r.filesByPath[path]; len(prev) > 0 {
 		r.checkGenProtoConflict(path)
 		err := errors.New("file %q is already registered", file.Path())
-		err = amendErrorWithCaller(err, prev[0], file)
+		err = formatRegistrationConflict(err, prev[0], file)
 		if !(r == GlobalFiles && ignoreConflict(file, err)) {
 			return err
 		}
@@ -137,7 +198,7 @@ func (r *Files) RegisterFile(file protoreflect.FileDescriptor) error {
 		case nil, *packageDescriptor:
 		default:
 			err := errors.New("file %q has a package name conflict over %v", file.Path(), name)
-			err = amendErrorWithCaller(err, prev, file)
+			err = formatRegistrationConflict(err, prev, file)
 			if r == GlobalFiles && ignoreConflict(file, err) {
 				err = nil
 			}
@@ -150,7 +211,7 @@ func (r *Files) RegisterFile(file protoreflect.FileDescriptor) error {
 		if prev := r.descsByName[d.FullName()]; prev != nil {
 			hasConflict = true
 			err = errors.New("file %q has a name conflict over %v", file.Path(), d.FullName())
-			err = amendErrorWithCaller(err, prev, file)
+			err = formatRegistrationConflict(err, prev, d)
 			if r == GlobalFiles && ignoreConflict(d, err) {
 				err = nil
 			}
@@ -485,10 +546,25 @@ type Types struct {
 }
 
 type (
-	typesByName         map[protoreflect.FullName]any
+	typesByName         map[protoreflect.FullName]*typeEntry
 	extensionsByMessage map[protoreflect.FullName]extensionsByNumber
-	extensionsByNumber  map[protoreflect.FieldNumber]protoreflect.ExtensionType
+	extensionsByNumber  map[protoreflect.FieldNumber]*extensionEntry
 )
+
+// typeEntry pairs a registered type with the source of its first
+// registration. The source is retained even if a warn/ignore conflict policy
+// later overwrites typ, which is what makes the startup self-check possible.
+type typeEntry struct {
+	typ    any
+	source registrationSource
+}
+
+// extensionEntry pairs a registered extension with the source of its first
+// registration, retaining the original source even after an overwrite.
+type extensionEntry struct {
+	typ    protoreflect.ExtensionType
+	source registrationSource
+}
 
 // RegisterMessage registers the provided message type.
 //
@@ -550,7 +626,7 @@ func (r *Types) RegisterExtension(xt protoreflect.ExtensionType) error {
 	message := xd.ContainingMessage().FullName()
 	if prev := r.extensionsByMessage[message][field]; prev != nil {
 		err := errors.New("extension number %d is already registered on message %v", field, message)
-		err = amendErrorWithCaller(err, prev, xt)
+		err = formatRegistrationConflict(err, prev.typ, xt)
 		if !(r == GlobalTypes && ignoreConflict(xd, err)) {
 			return err
 		}
@@ -565,17 +641,20 @@ func (r *Types) RegisterExtension(xt protoreflect.ExtensionType) error {
 	if r.extensionsByMessage[message] == nil {
 		r.extensionsByMessage[message] = make(extensionsByNumber)
 	}
-	r.extensionsByMessage[message][field] = xt
+	if entry := r.extensionsByMessage[message][field]; entry != nil {
+		entry.typ = xt // warn/ignore policy: overwrite but keep the original source
+	} else {
+		r.extensionsByMessage[message][field] = &extensionEntry{typ: xt, source: sourceOf(xt)}
+	}
 	r.numExtensions++
 	return nil
 }
 
 func (r *Types) register(kind string, desc protoreflect.Descriptor, typ any) error {
 	name := desc.FullName()
-	prev := r.typesByName[name]
-	if prev != nil {
+	if entry := r.typesByName[name]; entry != nil {
 		err := errors.New("%v %v is already registered", kind, name)
-		err = amendErrorWithCaller(err, prev, typ)
+		err = formatRegistrationConflict(err, entry.typ, typ)
 		if !(r == GlobalTypes && ignoreConflict(desc, err)) {
 			return err
 		}
@@ -583,7 +662,11 @@ func (r *Types) register(kind string, desc protoreflect.Descriptor, typ any) err
 	if r.typesByName == nil {
 		r.typesByName = make(typesByName)
 	}
-	r.typesByName[name] = typ
+	if entry := r.typesByName[name]; entry != nil {
+		entry.typ = typ // warn/ignore policy: overwrite but keep the original source
+	} else {
+		r.typesByName[name] = &typeEntry{typ: typ, source: sourceOf(typ)}
+	}
 	return nil
 }
 
@@ -599,7 +682,8 @@ func (r *Types) FindEnumByName(enum protoreflect.FullName) (protoreflect.EnumTyp
 		globalMutex.RLock()
 		defer globalMutex.RUnlock()
 	}
-	if v := r.typesByName[enum]; v != nil {
+	if entry := r.typesByName[enum]; entry != nil {
+		v := entry.typ
 		if et, _ := v.(protoreflect.EnumType); et != nil {
 			return et, nil
 		}
@@ -620,7 +704,8 @@ func (r *Types) FindMessageByName(message protoreflect.FullName) (protoreflect.M
 		globalMutex.RLock()
 		defer globalMutex.RUnlock()
 	}
-	if v := r.typesByName[message]; v != nil {
+	if entry := r.typesByName[message]; entry != nil {
+		v := entry.typ
 		if mt, _ := v.(protoreflect.MessageType); mt != nil {
 			return mt, nil
 		}
@@ -648,7 +733,8 @@ func (r *Types) FindMessageByURL(url string) (protoreflect.MessageType, error) {
 		message = message[i+len("/"):]
 	}
 
-	if v := r.typesByName[message]; v != nil {
+	if entry := r.typesByName[message]; entry != nil {
+		v := entry.typ
 		if mt, _ := v.(protoreflect.MessageType); mt != nil {
 			return mt, nil
 		}
@@ -671,7 +757,8 @@ func (r *Types) FindExtensionByName(field protoreflect.FullName) (protoreflect.E
 		globalMutex.RLock()
 		defer globalMutex.RUnlock()
 	}
-	if v := r.typesByName[field]; v != nil {
+	if entry := r.typesByName[field]; entry != nil {
+		v := entry.typ
 		if xt, _ := v.(protoreflect.ExtensionType); xt != nil {
 			return xt, nil
 		}
@@ -685,8 +772,8 @@ func (r *Types) FindExtensionByName(field protoreflect.FullName) (protoreflect.E
 		if flags.ProtoLegacy {
 			if _, ok := v.(protoreflect.MessageType); ok {
 				field := field.Append(messageset.ExtensionName)
-				if v := r.typesByName[field]; v != nil {
-					if xt, _ := v.(protoreflect.ExtensionType); xt != nil {
+				if entry := r.typesByName[field]; entry != nil {
+					if xt, _ := entry.typ.(protoreflect.ExtensionType); xt != nil {
 						if messageset.IsMessageSetExtension(xt.TypeDescriptor()) {
 							return xt, nil
 						}
@@ -712,8 +799,8 @@ func (r *Types) FindExtensionByNumber(message protoreflect.FullName, field proto
 		globalMutex.RLock()
 		defer globalMutex.RUnlock()
 	}
-	if xt, ok := r.extensionsByMessage[message][field]; ok {
-		return xt, nil
+	if entry, ok := r.extensionsByMessage[message][field]; ok {
+		return entry.typ, nil
 	}
 	return nil, NotFound
 }
@@ -740,8 +827,8 @@ func (r *Types) RangeEnums(f func(protoreflect.EnumType) bool) {
 		globalMutex.RLock()
 		defer globalMutex.RUnlock()
 	}
-	for _, typ := range r.typesByName {
-		if et, ok := typ.(protoreflect.EnumType); ok {
+	for _, entry := range r.typesByName {
+		if et, ok := entry.typ.(protoreflect.EnumType); ok {
 			if !f(et) {
 				return
 			}
@@ -771,8 +858,8 @@ func (r *Types) RangeMessages(f func(protoreflect.MessageType) bool) {
 		globalMutex.RLock()
 		defer globalMutex.RUnlock()
 	}
-	for _, typ := range r.typesByName {
-		if mt, ok := typ.(protoreflect.MessageType); ok {
+	for _, entry := range r.typesByName {
+		if mt, ok := entry.typ.(protoreflect.MessageType); ok {
 			if !f(mt) {
 				return
 			}
@@ -802,8 +889,8 @@ func (r *Types) RangeExtensions(f func(protoreflect.ExtensionType) bool) {
 		globalMutex.RLock()
 		defer globalMutex.RUnlock()
 	}
-	for _, typ := range r.typesByName {
-		if xt, ok := typ.(protoreflect.ExtensionType); ok {
+	for _, entry := range r.typesByName {
+		if xt, ok := entry.typ.(protoreflect.ExtensionType); ok {
 			if !f(xt) {
 				return
 			}
@@ -834,11 +921,136 @@ func (r *Types) RangeExtensionsByMessage(message protoreflect.FullName, f func(p
 		globalMutex.RLock()
 		defer globalMutex.RUnlock()
 	}
-	for _, xt := range r.extensionsByMessage[message] {
-		if !f(xt) {
+	for _, entry := range r.extensionsByMessage[message] {
+		if !f(entry.typ) {
 			return
 		}
 	}
+}
+
+// RegistrationConflict describes a single registration conflict detected by
+// a registration self-check, identifying the two registration sources.
+type RegistrationConflict struct {
+	// Name is the fully-qualified name of the conflicting descriptor, or the
+	// full name of the containing message for extension number conflicts.
+	Name protoreflect.FullName
+	// Kind identifies what is registered: "message", "enum", "extension",
+	// or "file".
+	Kind string
+	// Field is the conflicting extension field number.
+	// It is zero for all non-extension conflicts.
+	Field protoreflect.FieldNumber
+	// Previous is the source of the first registration.
+	Previous registrationSource
+	// Current is the source of the later registration that overwrote it.
+	Current registrationSource
+}
+
+func (c RegistrationConflict) Error() string {
+	if c.Kind == "extension" && c.Field != 0 {
+		return fmt.Sprintf("proto: duplicate %s registration: %v field %d\n\tpreviously from: %q\n\tcurrently from:  %q",
+			c.Kind, c.Name, c.Field, c.Previous, c.Current)
+	}
+	return fmt.Sprintf("proto: duplicate %s registration: %v\n\tpreviously from: %q\n\tcurrently from:  %q",
+		c.Kind, c.Name, c.Previous, c.Current)
+}
+
+// CheckRegistrationConflicts performs a registration self-check over every
+// type recorded in the registry and returns all detected conflicts, joined
+// with errors.Join. It returns nil when no conflicts are present.
+//
+// Conflicts can only accumulate when the global conflict policy is set to
+// "warn" or "ignore" (see GOLANG_PROTOBUF_REGISTRATION_CONFLICT), since the
+// default "panic" policy rejects the second registration immediately.
+// Callers can invoke this at startup and refuse to start when it reports an
+// error, preventing a silently overwritten type from reaching production.
+func (r *Types) CheckRegistrationConflicts() error {
+	if r == nil {
+		return nil
+	}
+	if r == GlobalTypes {
+		globalMutex.RLock()
+		defer globalMutex.RUnlock()
+	}
+	return r.checkRegistrationConflictsLocked()
+}
+
+func (r *Types) checkRegistrationConflictsLocked() error {
+	var conflicts []error
+	for name, entry := range r.typesByName {
+		if currSrc := sourceOf(entry.typ); currSrc != entry.source {
+			conflicts = append(conflicts, RegistrationConflict{
+				Name:     name,
+				Kind:     typeName(entry.typ),
+				Previous: entry.source,
+				Current:  currSrc,
+			})
+		}
+	}
+	for message, byNumber := range r.extensionsByMessage {
+		for field, entry := range byNumber {
+			if currSrc := sourceOf(entry.typ); currSrc != entry.source {
+				conflicts = append(conflicts, RegistrationConflict{
+					Name:     message,
+					Kind:     "extension",
+					Field:    field,
+					Previous: entry.source,
+					Current:  currSrc,
+				})
+			}
+		}
+	}
+	return stderrors.Join(conflicts...)
+}
+
+// CheckRegistrationConflicts performs a registration self-check over every
+// file descriptor recorded in the registry and returns all detected
+// conflicts, joined with errors.Join. It returns nil when no conflicts are
+// present.
+func (r *Files) CheckRegistrationConflicts() error {
+	if r == nil {
+		return nil
+	}
+	if r == GlobalFiles {
+		globalMutex.RLock()
+		defer globalMutex.RUnlock()
+	}
+	return r.checkRegistrationConflictsLocked()
+}
+
+func (r *Files) checkRegistrationConflictsLocked() error {
+	var conflicts []error
+	for path, files := range r.filesByPath {
+		if len(files) < 2 {
+			continue
+		}
+		prevSrc := sourceOf(files[0])
+		for _, file := range files[1:] {
+			currSrc := sourceOf(file)
+			conflicts = append(conflicts, RegistrationConflict{
+				Name:     protoreflect.FullName(path),
+				Kind:     "file",
+				Previous: prevSrc,
+				Current:  currSrc,
+			})
+			prevSrc = currSrc
+		}
+	}
+	return stderrors.Join(conflicts...)
+}
+
+// CheckGlobalRegistrationConflicts performs a startup registration self-check
+// across the global file and type registries and returns every detected
+// conflict, joined with errors.Join. A non-nil result means duplicate
+// registrations have overwritten each other and the process should refuse to
+// start; nil means the registries are consistent.
+func CheckGlobalRegistrationConflicts() error {
+	globalMutex.RLock()
+	defer globalMutex.RUnlock()
+	return stderrors.Join(
+		GlobalFiles.checkRegistrationConflictsLocked(),
+		GlobalTypes.checkRegistrationConflictsLocked(),
+	)
 }
 
 func typeName(t any) string {
@@ -852,31 +1064,4 @@ func typeName(t any) string {
 	default:
 		return fmt.Sprintf("%T", t)
 	}
-}
-
-func amendErrorWithCaller(err error, prev, curr any) error {
-	prevPkg := goPackage(prev)
-	currPkg := goPackage(curr)
-	if prevPkg == "" || currPkg == "" || prevPkg == currPkg {
-		return err
-	}
-	return errors.New("%s\n\tpreviously from: %q\n\tcurrently from:  %q", err, prevPkg, currPkg)
-}
-
-func goPackage(v any) string {
-	switch d := v.(type) {
-	case protoreflect.EnumType:
-		v = d.Descriptor()
-	case protoreflect.MessageType:
-		v = d.Descriptor()
-	case protoreflect.ExtensionType:
-		v = d.TypeDescriptor()
-	}
-	if d, ok := v.(protoreflect.Descriptor); ok {
-		v = d.ParentFile()
-	}
-	if d, ok := v.(interface{ GoPackagePath() string }); ok {
-		return d.GoPackagePath()
-	}
-	return ""
 }
